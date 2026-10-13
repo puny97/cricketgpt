@@ -1,9 +1,6 @@
 name: CricketGPT CI
 
 on:
-  push:
-    branches:
-      - '**'
   pull_request:
     branches:
       - '**'
