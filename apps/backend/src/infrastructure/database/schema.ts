@@ -1,7 +1,7 @@
 import { pgTable, varchar, date, timestamp, uuid } from 'drizzle-orm/pg-core';
 
 export const players = pgTable('players', {
-  id: uuid('id').primaryKey(),
+  id: uuid('id').defaultRandom().primaryKey(),
 
   fullName: varchar('full_name', {
     length: 150,
