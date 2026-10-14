@@ -1,4 +1,4 @@
-import { Controller, Get, Query } from '@nestjs/common';
+import { Controller, Get, Param, ParseUUIDPipe, Query } from '@nestjs/common';
 import { MatchesService } from './matches.service';
 
 @Controller('matches')
@@ -6,7 +6,7 @@ export class MatchesController {
   constructor(private readonly matchesService: MatchesService) {}
 
   @Get()
-  fondAll(
+  findAll(
     @Query()
     query: {
       page?: string;
@@ -18,5 +18,10 @@ export class MatchesController {
     },
   ) {
     return this.matchesService.findAll(query);
+  }
+
+  @Get(':id')
+  findById(@Param('id', new ParseUUIDPipe()) id: string) {
+    return this.matchesService.findById(id);
   }
 }

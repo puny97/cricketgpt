@@ -1,4 +1,9 @@
-import { BadRequestException, Inject, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { and, count, desc, eq, gte, lte } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { alias } from 'drizzle-orm/pg-core';
@@ -138,5 +143,85 @@ export class MatchesService {
         `${field} must be a valid date in YYYY-MM-DD format`,
       );
     }
+  }
+
+  async findById(id: string) {
+    const team1 = alias(schema.teams, 'team1');
+    const team2 = alias(schema.teams, 'team2');
+    const tossWinner = alias(schema.teams, 'toss_winnner');
+    const matchWinner = alias(schema.teams, 'match_winnner');
+
+    const rows = await this.db
+      .select({
+        id: schema.matches.id,
+        source: schema.matches.source,
+        sourceMatchId: schema.matches.sourceMatchId,
+        matchType: schema.matches.matchType,
+        gender: schema.matches.gender,
+        matchDate: schema.matches.matchDate,
+        venue: schema.matches.venue,
+        city: schema.matches.city,
+
+        team1: team1.name,
+        team2: team2.name,
+
+        competitionName: schema.competitions.name,
+        competitionSeason: schema.competitions.season,
+
+        tossWinner: tossWinner.name,
+        tossDecision: schema.matches.tossDecision,
+
+        winner: matchWinner.name,
+        outcome: schema.matches.outcome,
+        playerOfMatchNames: schema.matches.playerOfMatchNames,
+      })
+      .from(schema.matches)
+      .leftJoin(team1, eq(schema.matches.team1Id, team1.id))
+      .leftJoin(team2, eq(schema.matches.team2Id, team2.id))
+      .leftJoin(tossWinner, eq(schema.matches.tossWinnerTeamId, tossWinner.id))
+      .leftJoin(matchWinner, eq(schema.matches.winnerTeamId, matchWinner.id))
+      .leftJoin(
+        schema.competitions,
+        eq(schema.matches.competitionId, schema.competitions.id),
+      )
+      .where(eq(schema.matches.id, id))
+      .limit(1);
+
+    const match = rows[0];
+
+    if (!match) {
+      throw new NotFoundException(`Match with id ${id} not found`);
+    }
+
+    const {
+      team1: team1Name,
+      team2: team2Name,
+      tossWinner: tossWinnerName,
+      tossDecision,
+      competitionName,
+      competitionSeason,
+      winner,
+      outcome,
+      ...details
+    } = match;
+
+    return {
+      ...details,
+      teams: {
+        team1: team1Name,
+        team2: team2Name,
+      },
+      competition: competitionName
+        ? { name: competitionName, season: competitionSeason }
+        : null,
+      toss: {
+        winner: tossWinnerName,
+        decision: tossDecision,
+      },
+      result: {
+        winner,
+        outcome,
+      },
+    };
   }
 }
