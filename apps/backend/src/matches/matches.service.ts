@@ -4,7 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { and, count, desc, eq, gte, lte } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, inArray, lte } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { alias } from 'drizzle-orm/pg-core';
 import { DATABASE } from '../infrastructure/database/database.module';
@@ -501,6 +501,204 @@ export class MatchesService {
     return {
       matchId,
       innings: scorecards,
+    };
+  }
+
+  async getDeliveries(
+    matchId: string,
+    inningsNumber: number,
+    pageInput?: string,
+    limitInput?: string,
+  ) {
+    const parsePositiveInteger = (
+      value: string | undefined,
+      defaultValue: number,
+      field: string,
+    ): number => {
+      if (value === undefined) {
+        return defaultValue;
+      }
+
+      if (!/^[1-9]\d*$/.test(value)) {
+        throw new BadRequestException(`${field} must be a positive integer`);
+      }
+
+      const parsed = Number(value);
+
+      if (!Number.isSafeInteger(parsed)) {
+        throw new BadRequestException(
+          `${field} is outside the supported range`,
+        );
+      }
+
+      return parsed;
+    };
+
+    if (!Number.isSafeInteger(inningsNumber) || inningsNumber < 1) {
+      throw new BadRequestException('inningsNumber must be a positive integer');
+    }
+
+    const page = parsePositiveInteger(pageInput, 1, 'page');
+    const limit = parsePositiveInteger(limitInput, 20, 'limit');
+
+    if (limit > 100) {
+      throw new BadRequestException('limit cannot exceed 100');
+    }
+
+    // Confirm that the match exists.
+    const matchRows = await this.db
+      .select({ id: schema.matches.id })
+      .from(schema.matches)
+      .where(eq(schema.matches.id, matchId))
+      .limit(1);
+
+    if (!matchRows[0]) {
+      throw new NotFoundException(`Match with ID "${matchId}" was not found`);
+    }
+
+    // Find the requested innings within this match.
+    const inningsRows = await this.db
+      .select({
+        id: schema.innings.id,
+        inningsNumber: schema.innings.inningsNumber,
+        battingTeamId: schema.innings.battingTeamId,
+        battingTeam: schema.teams.name,
+        isSuperOver: schema.innings.isSuperOver,
+      })
+      .from(schema.innings)
+      .leftJoin(schema.teams, eq(schema.innings.battingTeamId, schema.teams.id))
+      .where(
+        and(
+          eq(schema.innings.matchId, matchId),
+          eq(schema.innings.inningsNumber, inningsNumber),
+        ),
+      )
+      .limit(1);
+
+    const innings = inningsRows[0];
+
+    if (!innings) {
+      throw new NotFoundException(
+        `Innings ${inningsNumber} was not found for match "${matchId}"`,
+      );
+    }
+
+    const batter = alias(schema.players, 'delivery_batter');
+    const bowler = alias(schema.players, 'delivery_bowler');
+    const nonStriker = alias(schema.players, 'delivery_non_striker');
+
+    const [countRows, deliveryRows] = await Promise.all([
+      this.db
+        .select({ total: count() })
+        .from(schema.deliveries)
+        .where(eq(schema.deliveries.inningsId, innings.id)),
+
+      this.db
+        .select({
+          id: schema.deliveries.id,
+          deliveryNumber: schema.deliveries.deliveryNumber,
+          overNumber: schema.deliveries.overNumber,
+          batterId: schema.deliveries.batterId,
+          bowlerId: schema.deliveries.bowlerId,
+          nonStrikerId: schema.deliveries.nonStrikerId,
+          batter: batter.fullName,
+          bowler: bowler.fullName,
+          nonStriker: nonStriker.fullName,
+          batterRuns: schema.deliveries.batterRuns,
+          extrasRuns: schema.deliveries.extrasRuns,
+          totalRuns: schema.deliveries.totalRuns,
+          extras: schema.deliveries.extras,
+        })
+        .from(schema.deliveries)
+        .leftJoin(batter, eq(schema.deliveries.batterId, batter.id))
+        .leftJoin(bowler, eq(schema.deliveries.bowlerId, bowler.id))
+        .leftJoin(nonStriker, eq(schema.deliveries.nonStrikerId, nonStriker.id))
+        .where(eq(schema.deliveries.inningsId, innings.id))
+        .orderBy(asc(schema.deliveries.deliveryNumber))
+        .limit(limit)
+        .offset((page - 1) * limit),
+    ]);
+
+    const deliveryIds = deliveryRows.map((delivery) => delivery.id);
+
+    // Query wickets only for the deliveries on this page.
+    const wicketRows =
+      deliveryIds.length > 0
+        ? await this.db
+            .select({
+              deliveryId: schema.deliveryWickets.deliveryId,
+              wicketNumber: schema.deliveryWickets.wicketNumber,
+              playerOutId: schema.deliveryWickets.playerOutId,
+              playerOut: schema.players.fullName,
+              dismissalKind: schema.deliveryWickets.dismissalKind,
+              fielders: schema.deliveryWickets.fielders,
+            })
+            .from(schema.deliveryWickets)
+            .leftJoin(
+              schema.players,
+              eq(schema.deliveryWickets.playerOutId, schema.players.id),
+            )
+            .where(inArray(schema.deliveryWickets.deliveryId, deliveryIds))
+            .orderBy(asc(schema.deliveryWickets.wicketNumber))
+        : [];
+
+    const wicketsByDelivery = new Map<string, typeof wicketRows>();
+
+    for (const wicket of wicketRows) {
+      const existing = wicketsByDelivery.get(wicket.deliveryId) ?? [];
+
+      existing.push(wicket);
+      wicketsByDelivery.set(wicket.deliveryId, existing);
+    }
+
+    const data = deliveryRows.map((delivery) => ({
+      deliveryNumber: delivery.deliveryNumber,
+      overNumber: delivery.overNumber,
+      batter: {
+        id: delivery.batterId,
+        name: delivery.batter,
+      },
+      bowler: {
+        id: delivery.bowlerId,
+        name: delivery.bowler,
+      },
+      nonStriker: {
+        id: delivery.nonStrikerId,
+        name: delivery.nonStriker,
+      },
+      runs: {
+        batter: delivery.batterRuns,
+        extras: delivery.extrasRuns,
+        total: delivery.totalRuns,
+      },
+      extras: delivery.extras,
+      wickets: (wicketsByDelivery.get(delivery.id) ?? []).map((wicket) => ({
+        wicketNumber: wicket.wicketNumber,
+        playerOut: {
+          id: wicket.playerOutId,
+          name: wicket.playerOut,
+        },
+        dismissalKind: wicket.dismissalKind,
+        fielders: wicket.fielders,
+      })),
+    }));
+
+    const total = Number(countRows[0]?.total ?? 0);
+
+    return {
+      matchId,
+      innings: {
+        inningsNumber: innings.inningsNumber,
+        battingTeam: innings.battingTeam,
+        isSuperOver: innings.isSuperOver,
+      },
+      data,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
     };
   }
 }

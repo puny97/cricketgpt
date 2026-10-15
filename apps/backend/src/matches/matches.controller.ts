@@ -1,4 +1,11 @@
-import { Controller, Get, Param, ParseUUIDPipe, Query } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Param,
+  ParseIntPipe,
+  ParseUUIDPipe,
+  Query,
+} from '@nestjs/common';
 import { MatchesService } from './matches.service';
 
 @Controller('matches')
@@ -28,5 +35,15 @@ export class MatchesController {
   @Get(':id/scorecard')
   getScorecard(@Param('id', new ParseUUIDPipe()) id: string) {
     return this.matchesService.getScorecard(id);
+  }
+
+  @Get(':id/innings/:inningsNumber/deliveries')
+  getDeliveries(
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Param('inningsNumber', new ParseIntPipe()) inningsNumber: number,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.matchesService.getDeliveries(id, inningsNumber, page, limit);
   }
 }
