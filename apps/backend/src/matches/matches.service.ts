@@ -224,4 +224,309 @@ export class MatchesService {
       },
     };
   }
+
+  async getScorecard(matchId: string) {
+    const matchRows = await this.db
+      .select({ id: schema.matches.id })
+      .from(schema.matches)
+      .where(eq(schema.matches.id, matchId))
+      .limit(1);
+
+    if (!matchRows[0]) {
+      throw new NotFoundException(`Match with ID "${matchId}" was not found`);
+    }
+
+    const battingTeam = alias(schema.teams, 'batting_team');
+    const batter = alias(schema.players, 'batter');
+    const bowler = alias(schema.players, 'bowler');
+    const dismissedPlayer = alias(schema.players, 'dismissed_player');
+
+    const inningsRows = await this.db
+      .select({
+        id: schema.innings.id,
+        inningsNumber: schema.innings.inningsNumber,
+        isSuperOver: schema.innings.isSuperOver,
+        battingTeam: battingTeam.name,
+      })
+      .from(schema.innings)
+      .leftJoin(battingTeam, eq(schema.innings.battingTeamId, battingTeam.id))
+      .where(eq(schema.innings.matchId, matchId))
+      .orderBy(schema.innings.inningsNumber);
+
+    const deliveryRows = await this.db
+      .select({
+        id: schema.deliveries.id,
+        inningsId: schema.deliveries.inningsId,
+        overNumber: schema.deliveries.overNumber,
+        deliveryNumber: schema.deliveries.deliveryNumber,
+        batterId: schema.deliveries.batterId,
+        bowlerId: schema.deliveries.bowlerId,
+        batterRuns: schema.deliveries.batterRuns,
+        extrasRuns: schema.deliveries.extrasRuns,
+        totalRuns: schema.deliveries.totalRuns,
+        extras: schema.deliveries.extras,
+        batterName: batter.fullName,
+        bowlerName: bowler.fullName,
+      })
+      .from(schema.deliveries)
+      .innerJoin(
+        schema.innings,
+        eq(schema.deliveries.inningsId, schema.innings.id),
+      )
+      .leftJoin(batter, eq(schema.deliveries.batterId, batter.id))
+      .leftJoin(bowler, eq(schema.deliveries.bowlerId, bowler.id))
+      .where(eq(schema.innings.matchId, matchId))
+      .orderBy(schema.innings.inningsNumber, schema.deliveries.deliveryNumber);
+
+    const wicketRows = await this.db
+      .select({
+        inningsId: schema.deliveries.inningsId,
+        deliveryId: schema.deliveryWickets.deliveryId,
+        playerOutId: schema.deliveryWickets.playerOutId,
+        dismissalKind: schema.deliveryWickets.dismissalKind,
+        playerOutName: dismissedPlayer.fullName,
+      })
+      .from(schema.deliveryWickets)
+      .innerJoin(
+        schema.deliveries,
+        eq(schema.deliveryWickets.deliveryId, schema.deliveries.id),
+      )
+      .innerJoin(
+        schema.innings,
+        eq(schema.deliveries.inningsId, schema.innings.id),
+      )
+      .leftJoin(
+        dismissedPlayer,
+        eq(schema.deliveryWickets.playerOutId, dismissedPlayer.id),
+      )
+      .where(eq(schema.innings.matchId, matchId));
+
+    const scorecards = inningsRows.map((inningsRow) => {
+      const deliveries = deliveryRows.filter(
+        (delivery) => delivery.inningsId === inningsRow.id,
+      );
+
+      const wickets = wicketRows.filter(
+        (wicket) => wicket.inningsId === inningsRow.id,
+      );
+
+      const batting = new Map<
+        string,
+        {
+          playerId: string;
+          player: string;
+          runs: number;
+          balls: number;
+          fours: number;
+          sixes: number;
+          dismissal: string | null;
+        }
+      >();
+
+      const bowling = new Map<
+        string,
+        {
+          playerId: string;
+          player: string;
+          runsConceded: number;
+          legalBalls: number;
+          maidens: number;
+          wickets: number;
+        }
+      >();
+
+      const overFigures = new Map<
+        string,
+        { legalBalls: number; runsConceded: number }
+      >();
+
+      const extras = {
+        total: 0,
+        wides: 0,
+        noBalls: 0,
+        byes: 0,
+        legByes: 0,
+        penalty: 0,
+        other: 0,
+      };
+
+      let totalRuns = 0;
+      let inningsLegalBalls = 0;
+
+      for (const delivery of deliveries) {
+        const deliveryExtras = delivery.extras;
+        const wides = extraValue(deliveryExtras, 'wides');
+        const noBalls = extraValue(deliveryExtras, 'noballs');
+        const byes = extraValue(deliveryExtras, 'byes');
+        const legByes = extraValue(deliveryExtras, 'legbyes');
+        const penalty = extraValue(deliveryExtras, 'penalty');
+
+        totalRuns += delivery.totalRuns;
+        extras.total += delivery.extrasRuns;
+        extras.wides += wides;
+        extras.noBalls += noBalls;
+        extras.byes += byes;
+        extras.legByes += legByes;
+        extras.penalty += penalty;
+        extras.other += Math.max(
+          0,
+          delivery.extrasRuns - wides - noBalls - byes - legByes - penalty,
+        );
+
+        const batterId = delivery.batterId;
+        const batterFigure = batting.get(batterId) ?? {
+          playerId: batterId,
+          player: delivery.batterName ?? 'Unknown player',
+          runs: 0,
+          balls: 0,
+          fours: 0,
+          sixes: 0,
+          dismissal: null,
+        };
+
+        batterFigure.runs += delivery.batterRuns;
+
+        // Wides do not count as balls faced. No-balls do.
+        if (wides === 0) {
+          batterFigure.balls += 1;
+        }
+
+        // Approximate boundary counts until non-boundary metadata is stored.
+        if (delivery.batterRuns === 4) {
+          batterFigure.fours += 1;
+        }
+
+        if (delivery.batterRuns === 6) {
+          batterFigure.sixes += 1;
+        }
+
+        batting.set(batterId, batterFigure);
+
+        const bowlerId = delivery.bowlerId;
+        const bowlerFigure = bowling.get(bowlerId) ?? {
+          playerId: bowlerId,
+          player: delivery.bowlerName ?? 'Unknown player',
+          runsConceded: 0,
+          legalBalls: 0,
+          maidens: 0,
+          wickets: 0,
+        };
+
+        // Byes, leg-byes, and penalty extras are not charged
+        // to the bowler.
+        bowlerFigure.runsConceded += delivery.batterRuns + wides + noBalls;
+
+        const isLegalDelivery = wides === 0 && noBalls === 0;
+
+        const overKey = `${bowlerId}:${delivery.overNumber}`;
+        const overFigure = overFigures.get(overKey) ?? {
+          legalBalls: 0,
+          runsConceded: 0,
+        };
+
+        overFigure.runsConceded += delivery.batterRuns + wides + noBalls;
+
+        if (isLegalDelivery) {
+          bowlerFigure.legalBalls += 1;
+          inningsLegalBalls += 1;
+          overFigure.legalBalls += 1;
+        }
+
+        overFigures.set(overKey, overFigure);
+        bowling.set(bowlerId, bowlerFigure);
+      }
+
+      for (const [overKey, overFigure] of overFigures) {
+        if (overFigure.legalBalls === 6 && overFigure.runsConceded === 0) {
+          const bowlerId = overKey.split(':')[0];
+          const figure = bowling.get(bowlerId);
+
+          if (figure) {
+            figure.maidens += 1;
+          }
+        }
+      }
+
+      let wicketsLost = 0;
+
+      for (const wicket of wickets) {
+        if (wicket.dismissalKind.toLowerCase() !== 'retired hurt') {
+          wicketsLost += 1;
+        }
+
+        const dismissed = batting.get(wicket.playerOutId);
+
+        if (dismissed) {
+          dismissed.dismissal = wicket.dismissalKind;
+        }
+
+        if (isBowlerCreditedDismissal(wicket.dismissalKind)) {
+          // Find the bowler who delivered the ball on which the
+          // wicket fell.
+          const delivery = deliveries.find(
+            (item) => item.id === wicket.deliveryId,
+          );
+
+          if (delivery) {
+            const figure = bowling.get(delivery.bowlerId);
+
+            if (figure) {
+              figure.wickets += 1;
+            }
+          }
+        }
+      }
+
+      return {
+        inningsNumber: inningsRow.inningsNumber,
+        battingTeam: inningsRow.battingTeam,
+        isSuperOver: inningsRow.isSuperOver,
+        totalRuns,
+        wickets: wicketsLost,
+        legalBalls: inningsLegalBalls,
+        overs: formatOvers(inningsLegalBalls),
+        runRate:
+          inningsLegalBalls > 0
+            ? Number((totalRuns / (inningsLegalBalls / 6)).toFixed(2))
+            : 0,
+        extras,
+        batting: [...batting.values()],
+        bowling: [...bowling.values()].map((figure) => ({
+          ...figure,
+          overs: formatOvers(figure.legalBalls),
+        })),
+      };
+    });
+
+    return {
+      matchId,
+      innings: scorecards,
+    };
+  }
+}
+
+function extraValue(extras: unknown, key: string): number {
+  if (typeof extras !== 'object' || extras === null || Array.isArray(extras)) {
+    return 0;
+  }
+
+  const value = (extras as Record<string, unknown>)[key];
+
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function isBowlerCreditedDismissal(kind: string): boolean {
+  return [
+    'bowled',
+    'caught',
+    'caught and bowled',
+    'lbw',
+    'stumped',
+    'hit wicket',
+    'hit the ball twice',
+  ].includes(kind.toLowerCase());
+}
+
+function formatOvers(legalBalls: number): string {
+  return `${Math.floor(legalBalls / 6)}.${legalBalls % 6}`;
 }

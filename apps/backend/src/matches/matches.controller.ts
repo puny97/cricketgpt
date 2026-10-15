@@ -24,4 +24,9 @@ export class MatchesController {
   findById(@Param('id', new ParseUUIDPipe()) id: string) {
     return this.matchesService.findById(id);
   }
+
+  @Get(':id/scorecard')
+  getScorecard(@Param('id', new ParseUUIDPipe()) id: string) {
+    return this.matchesService.getScorecard(id);
+  }
 }
